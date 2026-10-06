@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -10,6 +12,12 @@ const SHOPIFY_STORE_DOMAIN =
 
 const SHOPIFY_ACCESS_TOKEN =
     process.env.SHOPIFY_ACCESS_TOKEN;
+
+const SUPABASE_URL =
+    process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+const SUPABASE_SERVICE_ROLE_KEY =
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 async function getShopifyProducts() {
     if (
@@ -87,6 +95,26 @@ export async function POST(request: Request) {
 
         const message = body.message;
         const conversation = body.conversation || [];
+
+        /*
+         * The frontend should eventually send:
+         *
+         * sessionId
+         * customerEmail
+         *
+         * If sessionId isn't supplied, create one.
+         */
+        const sessionId =
+            typeof body.sessionId === "string" &&
+                body.sessionId.trim()
+                ? body.sessionId.trim()
+                : crypto.randomUUID();
+
+        const customerEmail =
+            typeof body.customerEmail === "string" &&
+                body.customerEmail.trim()
+                ? body.customerEmail.trim()
+                : null;
 
         if (
             !message ||
@@ -236,13 +264,70 @@ export async function POST(request: Request) {
                     )
             );
 
+        const reply =
+            typeof parsed.reply === "string"
+                ? parsed.reply
+                : "I couldn't find a suitable recommendation.";
+
+        /*
+         * Save the AI interaction to Supabase.
+         *
+         * IMPORTANT:
+         * This runs after the AI response succeeds.
+         * Therefore a failed AI request won't create
+         * a fake conversation record.
+         */
+        if (
+            !SUPABASE_URL ||
+            !SUPABASE_SERVICE_ROLE_KEY
+        ) {
+            throw new Error(
+                "Missing Supabase environment variables"
+            );
+        }
+
+        const supabase = createClient(
+            SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY
+        );
+
+        const { error: supabaseError } =
+            await supabase
+                .from("ai_conversations")
+                .insert({
+                    session_id: sessionId,
+                    customer_email: customerEmail,
+                    user_message: message,
+                    ai_response: reply,
+                    recommended_products:
+                        recommendedProducts.map(
+                            (product: any) => ({
+                                id: product.id,
+                                title: product.title,
+                                handle: product.handle,
+                                variants:
+                                    product.variants.nodes,
+                            })
+                        ),
+                });
+
+        if (supabaseError) {
+            /*
+             * Don't break the customer's AI experience
+             * just because analytics storage failed.
+             */
+            console.error(
+                "Supabase conversation save error:",
+                supabaseError
+            );
+        }
+
         return NextResponse.json({
             success: true,
 
-            reply:
-                typeof parsed.reply === "string"
-                    ? parsed.reply
-                    : "I couldn't find a suitable recommendation.",
+            sessionId,
+
+            reply,
 
             products:
                 recommendedProducts.map(
